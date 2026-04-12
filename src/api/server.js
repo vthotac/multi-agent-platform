@@ -26,6 +26,13 @@ function createApp(orchestrator) {
     next();
   });
 
+app.get('/api/live', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    ts: new Date().toISOString(),
+  });
+});
+
   app.get('/api/health', async (_req, res) => {
     let supabaseOk = false;
     try {

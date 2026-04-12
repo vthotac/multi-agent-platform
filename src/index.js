@@ -8,7 +8,10 @@ const { registerEmailScanWorker, scheduleEmailScanCron } = require('./jobs/email
 const { registerDealScanWorker, scheduleDealScanCron } = require('./jobs/dealScan');
 const { insertLog } = require('./integrations/supabase');
 
-const port = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Listening on :${PORT}`);
+});
 
 async function main() {
   await insertLog('info', 'Platform booting', { port });
