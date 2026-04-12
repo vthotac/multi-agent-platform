@@ -1,24 +1,18 @@
-const express = require('express');
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
-const app = express();
+const { createApp } = require('./api/server');
+const { Orchestrator } = require('./orchestrator/orchestrator');
+
 const PORT = process.env.PORT || 3000;
 
-app.get('/api/live', (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    mode: 'bare-minimum',
-    ts: new Date().toISOString(),
-  });
-});
+function main() {
+  const orchestrator = new Orchestrator({ enableQueue: true });
+  const app = createApp(orchestrator);
 
-app.get('/api/health', (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    mode: 'bare-minimum',
-    ts: new Date().toISOString(),
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Listening on :${PORT}`);
   });
-});
+}
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Listening on :${PORT}`);
-});
+main();

@@ -26,13 +26,15 @@ function createApp(orchestrator) {
     next();
   });
 
-app.get('/api/live', (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    ts: new Date().toISOString(),
+  // Railway liveness route
+  app.get('/api/live', (_req, res) => {
+    res.status(200).json({
+      ok: true,
+      ts: new Date().toISOString(),
+    });
   });
-});
 
+  // Deep dependency check
   app.get('/api/health', async (_req, res) => {
     let supabaseOk = false;
     try {
