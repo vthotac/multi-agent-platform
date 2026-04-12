@@ -1,0 +1,10 @@
+node_modules/
+.env
+credentials.json
+service_account.json
+*.pem
+*.key
+dist/
+build/
+.DS_Store
+multi_agent_KEY_DETAILS
