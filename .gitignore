@@ -8,3 +8,4 @@ dist/
 build/
 .DS_Store
 multi_agent_KEY_DETAILS
+.env.backup.local
