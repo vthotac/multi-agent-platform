@@ -2,7 +2,7 @@ const cheerio = require('cheerio');
 const { BaseAgent } = require('./baseAgent');
 const { complete } = require('../services/llmService');
 
-const SYSTEM = `You detect shopping/deal opportunities from webpage text.
+const SYSTEM = `You extract shopping deals from webpage text.
 
 The user will provide:
 - a URL
@@ -11,18 +11,23 @@ The user will provide:
 
 Your job:
 1. Focus only on findings relevant to the query.
-2. Return STRICT JSON only:
+2. Prefer exact product/query matches over generic Apple or phone references.
+3. Return STRICT JSON only in this format:
 {
   "deals": [
     {
       "title": string,
+      "store": string,
+      "url": string,
+      "price": string,
       "why": string,
       "confidence": number
     }
   ]
 }
-3. confidence must be 0-1.
-4. If nothing notable is found, return:
+4. confidence must be 0-1.
+5. If a field is unknown, use an empty string.
+6. If nothing relevant is found, return:
 { "deals": [] }`;
 
 function parseUrlsFromEnv() {
@@ -103,6 +108,43 @@ function extractPageText(html) {
   return $('body').text().replace(/\s+/g, ' ').trim().slice(0, 24000);
 }
 
+function inferStoreFromUrl(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    if (host.includes('slickdeals')) return 'Slickdeals';
+    if (host.includes('bestbuy')) return 'Best Buy';
+    if (host.includes('amazon')) return 'Amazon';
+    if (host.includes('camelcamelcamel')) return 'CamelCamelCamel';
+    return host;
+  } catch {
+    return '';
+  }
+}
+
+function normalizeDeals(url, deals) {
+  if (!Array.isArray(deals)) return [];
+
+  const store = inferStoreFromUrl(url);
+
+  return deals
+    .filter((deal) => deal && typeof deal === 'object')
+    .map((deal) => ({
+      title: typeof deal.title === 'string' ? deal.title.trim() : '',
+      store:
+        typeof deal.store === 'string' && deal.store.trim()
+          ? deal.store.trim()
+          : store,
+      url: typeof deal.url === 'string' ? deal.url.trim() : url,
+      price: typeof deal.price === 'string' ? deal.price.trim() : '',
+      why: typeof deal.why === 'string' ? deal.why.trim() : '',
+      confidence:
+        typeof deal.confidence === 'number'
+          ? Math.max(0, Math.min(1, deal.confidence))
+          : 0,
+    }))
+    .filter((deal) => deal.title);
+}
+
 class DealFinderAgent extends BaseAgent {
   async run(payload = {}) {
     const query = normalizeQuery(payload);
@@ -123,6 +165,7 @@ class DealFinderAgent extends BaseAgent {
 
     const findings = [];
     const failures = [];
+    const allDeals = [];
 
     for (const url of urls) {
       try {
@@ -144,7 +187,7 @@ class DealFinderAgent extends BaseAgent {
             complete({
               system: SYSTEM,
               user,
-              temperature: 0.25,
+              temperature: 0.2,
               cacheTtlMs: 300_000,
             }),
           { label: 'gemini.dealDetect' }
@@ -157,10 +200,13 @@ class DealFinderAgent extends BaseAgent {
           parsed = { deals: [], note: 'non-json model output', raw };
         }
 
+        const deals = normalizeDeals(url, parsed.deals);
+        allDeals.push(...deals);
+
         findings.push({
           url,
           query,
-          deals: Array.isArray(parsed.deals) ? parsed.deals : [],
+          deals,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -182,15 +228,21 @@ class DealFinderAgent extends BaseAgent {
       );
     }
 
+    const rankedDeals = allDeals
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, 20);
+
     await this.log('info', 'Deal scan complete', {
       pages: findings.length,
       query,
       failedSources: failures.length,
+      totalDeals: rankedDeals.length,
     });
 
     return {
       agentType: 'deal_finder',
       query,
+      deals: rankedDeals,
       findings,
       failures,
     };
