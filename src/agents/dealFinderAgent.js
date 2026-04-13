@@ -2,16 +2,16 @@ const cheerio = require('cheerio');
 const { BaseAgent } = require('./baseAgent');
 const { complete } = require('../services/llmService');
 
-const SYSTEM = `You extract shopping deals from webpage text.
+const SYSTEM = `You rank shopping deal candidates for a user query.
 
-The user will provide:
-- a URL
-- extracted page text
-- a shopping/deal query such as "best iPhone 16 deals"
+You will receive:
+- a shopping query
+- a source URL
+- a list of extracted candidate items from that page
 
 Your job:
-1. Focus only on findings relevant to the query.
-2. Prefer exact product/query matches over generic Apple or phone references.
+1. Keep only candidates relevant to the query.
+2. Prefer exact product/query matches over generic references.
 3. Return STRICT JSON only in this format:
 {
   "deals": [
@@ -42,11 +42,9 @@ function normalizeQuery(payload = {}) {
   if (typeof payload.query === 'string' && payload.query.trim()) {
     return payload.query.trim();
   }
-
   if (typeof payload.input === 'string' && payload.input.trim()) {
     return payload.input.trim();
   }
-
   return '';
 }
 
@@ -72,7 +70,6 @@ function encodeQuery(query) {
 
 function buildQueryDrivenUrls(query) {
   if (!query) return [];
-
   const q = encodeQuery(query);
 
   return [
@@ -84,6 +81,68 @@ function buildQueryDrivenUrls(query) {
 
 function dedupeUrls(urls) {
   return [...new Set(urls.filter(Boolean))];
+}
+
+function inferStoreFromUrl(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    if (host.includes('slickdeals')) return 'Slickdeals';
+    if (host.includes('bestbuy')) return 'Best Buy';
+    if (host.includes('amazon')) return 'Amazon';
+    if (host.includes('camelcamelcamel')) return 'CamelCamelCamel';
+    return host;
+  } catch {
+    return '';
+  }
+}
+
+function absoluteUrl(base, href) {
+  if (!href || typeof href !== 'string') return '';
+  try {
+    return new URL(href, base).toString();
+  } catch {
+    return '';
+  }
+}
+
+function cleanText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function looksLikePrice(text) {
+  return /\$\s?\d[\d,]*(\.\d{2})?/.test(text);
+}
+
+function extractPrice(text) {
+  const match = String(text || '').match(/\$\s?\d[\d,]*(\.\d{2})?/);
+  return match ? match[0].replace(/\s+/g, '') : '';
+}
+
+function queryTokens(query) {
+  return cleanText(query)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t && t.length > 1);
+}
+
+function candidateScore(query, text) {
+  const qTokens = queryTokens(query);
+  const hay = cleanText(text).toLowerCase();
+  if (!qTokens.length) return 0;
+
+  let score = 0;
+  for (const t of qTokens) {
+    if (hay.includes(t)) score += 1;
+  }
+
+  if (hay.includes('iphone')) score += 2;
+  if (hay.includes('deal')) score += 1;
+  if (hay.includes('sale')) score += 1;
+  if (hay.includes('discount')) score += 1;
+  if (hay.includes('unlocked')) score += 1;
+  if (looksLikePrice(hay)) score += 1;
+
+  return score;
 }
 
 async function fetchHtml(url) {
@@ -102,41 +161,63 @@ async function fetchHtml(url) {
   return res.text();
 }
 
-function extractPageText(html) {
+function extractCandidatesFromHtml(pageUrl, html, query) {
   const $ = cheerio.load(html);
   $('script, style, noscript').remove();
-  return $('body').text().replace(/\s+/g, ' ').trim().slice(0, 24000);
+
+  const candidates = [];
+  const seen = new Set();
+
+  $('a[href]').each((_, el) => {
+    const $a = $(el);
+    const href = $a.attr('href');
+    const url = absoluteUrl(pageUrl, href);
+    if (!url) return;
+
+    const title = cleanText($a.text());
+    const parentText = cleanText($a.parent().text()).slice(0, 400);
+    const containerText = cleanText($a.closest('article, li, div').text()).slice(0, 500);
+
+    const combined = cleanText(`${title} ${parentText} ${containerText}`);
+    if (!combined || combined.length < 8) return;
+
+    const score = candidateScore(query, combined);
+    if (score < 2) return;
+
+    const price = extractPrice(combined);
+    const key = `${url}::${title}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    candidates.push({
+      title,
+      url,
+      price,
+      snippet: combined.slice(0, 500),
+      sourceUrl: pageUrl,
+      score,
+      store: inferStoreFromUrl(url || pageUrl),
+    });
+  });
+
+  return candidates
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 25);
 }
 
-function inferStoreFromUrl(url) {
-  try {
-    const host = new URL(url).hostname.replace(/^www\./, '');
-    if (host.includes('slickdeals')) return 'Slickdeals';
-    if (host.includes('bestbuy')) return 'Best Buy';
-    if (host.includes('amazon')) return 'Amazon';
-    if (host.includes('camelcamelcamel')) return 'CamelCamelCamel';
-    return host;
-  } catch {
-    return '';
-  }
-}
+function normalizeDeals(sourceUrl, deals) {
+  const fallbackStore = inferStoreFromUrl(sourceUrl);
 
-function normalizeDeals(url, deals) {
   if (!Array.isArray(deals)) return [];
-
-  const store = inferStoreFromUrl(url);
 
   return deals
     .filter((deal) => deal && typeof deal === 'object')
     .map((deal) => ({
-      title: typeof deal.title === 'string' ? deal.title.trim() : '',
-      store:
-        typeof deal.store === 'string' && deal.store.trim()
-          ? deal.store.trim()
-          : store,
-      url: typeof deal.url === 'string' ? deal.url.trim() : url,
-      price: typeof deal.price === 'string' ? deal.price.trim() : '',
-      why: typeof deal.why === 'string' ? deal.why.trim() : '',
+      title: cleanText(deal.title),
+      store: cleanText(deal.store) || fallbackStore,
+      url: cleanText(deal.url) || sourceUrl,
+      price: cleanText(deal.price),
+      why: cleanText(deal.why),
       confidence:
         typeof deal.confidence === 'number'
           ? Math.max(0, Math.min(1, deal.confidence))
@@ -173,21 +254,34 @@ class DealFinderAgent extends BaseAgent {
           label: `fetch:${url}`,
         });
 
-        const text = extractPageText(html);
+        const candidates = extractCandidatesFromHtml(url, html, query);
 
-        const user = [
-          `QUERY: ${query || '(none provided)'}`,
-          `URL: ${url}`,
-          `TEXT:`,
-          text,
-        ].join('\n');
+        if (!candidates.length) {
+          findings.push({
+            url,
+            query,
+            candidates: 0,
+            deals: [],
+          });
+          continue;
+        }
+
+        const user = JSON.stringify(
+          {
+            query,
+            sourceUrl: url,
+            candidates,
+          },
+          null,
+          2
+        );
 
         const raw = await this.withRetry(
           () =>
             complete({
               system: SYSTEM,
               user,
-              temperature: 0.2,
+              temperature: 0.15,
               cacheTtlMs: 300_000,
             }),
           { label: 'gemini.dealDetect' }
@@ -197,7 +291,7 @@ class DealFinderAgent extends BaseAgent {
         try {
           parsed = JSON.parse(raw);
         } catch {
-          parsed = { deals: [], note: 'non-json model output', raw };
+          parsed = { deals: [] };
         }
 
         const deals = normalizeDeals(url, parsed.deals);
@@ -206,6 +300,7 @@ class DealFinderAgent extends BaseAgent {
         findings.push({
           url,
           query,
+          candidates: candidates.length,
           deals,
         });
       } catch (err) {
