@@ -13,7 +13,22 @@ router.post('/', async (req, res, next) => {
       throw err;
     }
 
-    const payload = req.body && typeof req.body.payload === 'object' ? req.body.payload : {};
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const basePayload =
+      body.payload && typeof body.payload === 'object' ? body.payload : {};
+
+    const payload = {
+      ...basePayload,
+    };
+
+    if (typeof body.input === 'string' && body.input.trim()) {
+      payload.input = body.input.trim();
+    }
+
+    if (typeof body.query === 'string' && body.query.trim()) {
+      payload.query = body.query.trim();
+    }
+
     const orchestrator = req.app.locals.orchestrator;
     const out = await orchestrator.enqueueAgentTask(agentId, payload);
     res.status(202).json(out);
