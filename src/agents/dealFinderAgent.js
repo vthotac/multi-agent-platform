@@ -3,8 +3,19 @@ const { BaseAgent } = require('./baseAgent');
 const { complete } = require('../services/llmService');
 
 const SYSTEM = `You detect shopping/deal opportunities from webpage text.
-Return STRICT JSON: { "deals": [ { "title": string, "why": string, "confidence": number } ] }
-confidence is 0-1. If nothing notable, return deals: [].`;
+
+The user will provide:
+- a URL
+- extracted page text
+- an optional shopping/deal query such as "best iPhone 16 deals"
+
+Your job:
+1. Focus on findings relevant to the query if a query is provided.
+2. Return STRICT JSON only:
+{ "deals": [ { "title": string, "why": string, "confidence": number } ] }
+3. confidence must be 0-1.
+4. If nothing notable is found, return:
+{ "deals": [] }`;
 
 function parseUrlsFromEnv() {
   const raw = process.env.DEAL_SCAN_URLS || '';
@@ -12,6 +23,30 @@ function parseUrlsFromEnv() {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function normalizeQuery(payload = {}) {
+  if (typeof payload.query === 'string' && payload.query.trim()) {
+    return payload.query.trim();
+  }
+
+  if (typeof payload.input === 'string' && payload.input.trim()) {
+    return payload.input.trim();
+  }
+
+  return '';
+}
+
+function normalizeUrls(payload = {}) {
+  if (Array.isArray(payload.urls) && payload.urls.length) {
+    return payload.urls.filter(Boolean);
+  }
+
+  if (payload.payload && Array.isArray(payload.payload.urls) && payload.payload.urls.length) {
+    return payload.payload.urls.filter(Boolean);
+  }
+
+  return parseUrlsFromEnv();
 }
 
 async function fetchHtml(url) {
@@ -22,17 +57,21 @@ async function fetchHtml(url) {
     },
     redirect: 'follow',
   });
+
   if (!res.ok) {
     throw new Error(`Fetch failed ${res.status} for ${url}`);
   }
+
   return res.text();
 }
 
 class DealFinderAgent extends BaseAgent {
   async run(payload = {}) {
-    const urls = Array.isArray(payload.urls) && payload.urls.length ? payload.urls : parseUrlsFromEnv();
+    const query = normalizeQuery(payload);
+    const urls = normalizeUrls(payload);
+
     if (!urls.length) {
-      throw new Error('No URLs supplied in payload.urls and DEAL_SCAN_URLS is empty');
+      throw new Error('No URLs supplied and DEAL_SCAN_URLS is empty');
     }
 
     const findings = [];
@@ -41,9 +80,16 @@ class DealFinderAgent extends BaseAgent {
       const html = await this.withRetry(() => fetchHtml(url), { label: `fetch:${url}` });
       const $ = cheerio.load(html);
       $('script, style, noscript').remove();
+
       const text = $('body').text().replace(/\s+/g, ' ').trim().slice(0, 24000);
 
-      const user = `URL: ${url}\nTEXT:\n${text}`;
+      const user = [
+        `QUERY: ${query || '(none provided)'}`,
+        `URL: ${url}`,
+        `TEXT:`,
+        text,
+      ].join('\n');
+
       const raw = await this.withRetry(
         () =>
           complete({
@@ -62,13 +108,21 @@ class DealFinderAgent extends BaseAgent {
         parsed = { deals: [], note: 'non-json model output', raw };
       }
 
-      findings.push({ url, deals: parsed.deals || [] });
+      findings.push({
+        url,
+        query,
+        deals: Array.isArray(parsed.deals) ? parsed.deals : [],
+      });
     }
 
-    await this.log('info', 'Deal scan complete', { pages: findings.length });
+    await this.log('info', 'Deal scan complete', {
+      pages: findings.length,
+      query,
+    });
 
     return {
       agentType: 'deal_finder',
+      query,
       findings,
     };
   }
