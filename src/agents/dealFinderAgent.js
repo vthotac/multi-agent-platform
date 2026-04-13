@@ -7,12 +7,20 @@ const SYSTEM = `You detect shopping/deal opportunities from webpage text.
 The user will provide:
 - a URL
 - extracted page text
-- an optional shopping/deal query such as "best iPhone 16 deals"
+- a shopping/deal query such as "best iPhone 16 deals"
 
 Your job:
-1. Focus on findings relevant to the query if a query is provided.
+1. Focus only on findings relevant to the query.
 2. Return STRICT JSON only:
-{ "deals": [ { "title": string, "why": string, "confidence": number } ] }
+{
+  "deals": [
+    {
+      "title": string,
+      "why": string,
+      "confidence": number
+    }
+  ]
+}
 3. confidence must be 0-1.
 4. If nothing notable is found, return:
 { "deals": [] }`;
@@ -42,17 +50,41 @@ function normalizeUrls(payload = {}) {
     return payload.urls.filter(Boolean);
   }
 
-  if (payload.payload && Array.isArray(payload.payload.urls) && payload.payload.urls.length) {
+  if (
+    payload.payload &&
+    Array.isArray(payload.payload.urls) &&
+    payload.payload.urls.length
+  ) {
     return payload.payload.urls.filter(Boolean);
   }
 
-  return parseUrlsFromEnv();
+  return [];
+}
+
+function encodeQuery(query) {
+  return encodeURIComponent(query.trim());
+}
+
+function buildQueryDrivenUrls(query) {
+  if (!query) return [];
+
+  const q = encodeQuery(query);
+
+  return [
+    `https://slickdeals.net/newsearch.php?q=${q}`,
+    `https://www.bestbuy.com/site/searchpage.jsp?st=${q}`,
+    `https://www.amazon.com/s?k=${q}`,
+  ];
+}
+
+function dedupeUrls(urls) {
+  return [...new Set(urls.filter(Boolean))];
 }
 
 async function fetchHtml(url) {
   const res = await fetch(url, {
     headers: {
-      'user-agent': 'multi-agent-platform/1.0 (+https://example.local)',
+      'user-agent': 'Mozilla/5.0 (compatible; multi-agent-platform/1.0)',
       accept: 'text/html,application/xhtml+xml',
     },
     redirect: 'follow',
@@ -65,65 +97,102 @@ async function fetchHtml(url) {
   return res.text();
 }
 
+function extractPageText(html) {
+  const $ = cheerio.load(html);
+  $('script, style, noscript').remove();
+  return $('body').text().replace(/\s+/g, ' ').trim().slice(0, 24000);
+}
+
 class DealFinderAgent extends BaseAgent {
   async run(payload = {}) {
     const query = normalizeQuery(payload);
-    const urls = normalizeUrls(payload);
+
+    const explicitUrls = normalizeUrls(payload);
+    const defaultUrls = parseUrlsFromEnv();
+    const queryDrivenUrls = buildQueryDrivenUrls(query);
+
+    const urls = dedupeUrls([
+      ...explicitUrls,
+      ...queryDrivenUrls,
+      ...defaultUrls,
+    ]);
 
     if (!urls.length) {
       throw new Error('No URLs supplied and DEAL_SCAN_URLS is empty');
     }
 
     const findings = [];
+    const failures = [];
 
     for (const url of urls) {
-      const html = await this.withRetry(() => fetchHtml(url), { label: `fetch:${url}` });
-      const $ = cheerio.load(html);
-      $('script, style, noscript').remove();
-
-      const text = $('body').text().replace(/\s+/g, ' ').trim().slice(0, 24000);
-
-      const user = [
-        `QUERY: ${query || '(none provided)'}`,
-        `URL: ${url}`,
-        `TEXT:`,
-        text,
-      ].join('\n');
-
-      const raw = await this.withRetry(
-        () =>
-          complete({
-            system: SYSTEM,
-            user,
-            temperature: 0.25,
-            cacheTtlMs: 300_000,
-          }),
-        { label: 'gemini.dealDetect' },
-      );
-
-      let parsed;
       try {
-        parsed = JSON.parse(raw);
-      } catch {
-        parsed = { deals: [], note: 'non-json model output', raw };
-      }
+        const html = await this.withRetry(() => fetchHtml(url), {
+          label: `fetch:${url}`,
+        });
 
-      findings.push({
-        url,
-        query,
-        deals: Array.isArray(parsed.deals) ? parsed.deals : [],
-      });
+        const text = extractPageText(html);
+
+        const user = [
+          `QUERY: ${query || '(none provided)'}`,
+          `URL: ${url}`,
+          `TEXT:`,
+          text,
+        ].join('\n');
+
+        const raw = await this.withRetry(
+          () =>
+            complete({
+              system: SYSTEM,
+              user,
+              temperature: 0.25,
+              cacheTtlMs: 300_000,
+            }),
+          { label: 'gemini.dealDetect' }
+        );
+
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = { deals: [], note: 'non-json model output', raw };
+        }
+
+        findings.push({
+          url,
+          query,
+          deals: Array.isArray(parsed.deals) ? parsed.deals : [],
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failures.push({ url, message });
+
+        await this.log('warn', 'Deal scan source failed', {
+          url,
+          query,
+          message,
+        });
+      }
+    }
+
+    if (!findings.length) {
+      throw new Error(
+        `All deal scan sources failed: ${failures
+          .map((f) => `${f.url} -> ${f.message}`)
+          .join(' | ')}`
+      );
     }
 
     await this.log('info', 'Deal scan complete', {
       pages: findings.length,
       query,
+      failedSources: failures.length,
     });
 
     return {
       agentType: 'deal_finder',
       query,
       findings,
+      failures,
     };
   }
 }
