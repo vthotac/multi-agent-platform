@@ -136,6 +136,8 @@ function candidateScore(query, text) {
   }
 
   if (hay.includes('iphone')) score += 2;
+  if (hay.includes('macbook')) score += 2;
+  if (hay.includes('mini')) score += 1;
   if (hay.includes('deal')) score += 1;
   if (hay.includes('sale')) score += 1;
   if (hay.includes('discount')) score += 1;
@@ -226,6 +228,32 @@ function normalizeDeals(sourceUrl, deals) {
     .filter((deal) => deal.title);
 }
 
+function fallbackDealsFromCandidates(sourceUrl, candidates) {
+  return candidates
+    .slice(0, 10)
+    .map((c) => ({
+      title: cleanText(c.title),
+      store: cleanText(c.store) || inferStoreFromUrl(sourceUrl),
+      url: cleanText(c.url) || sourceUrl,
+      price: cleanText(c.price),
+      why: 'Matched query tokens from extracted page candidates',
+      confidence: Math.max(0.35, Math.min(0.89, c.score / 10)),
+    }))
+    .filter((deal) => deal.title);
+}
+
+function isQuotaOrTemporaryModelError(message) {
+  const m = String(message || '').toLowerCase();
+  return (
+    m.includes('429') ||
+    m.includes('quota') ||
+    m.includes('rate limit') ||
+    m.includes('too many requests') ||
+    m.includes('503 service unavailable') ||
+    m.includes('currently experiencing high demand')
+  );
+}
+
 class DealFinderAgent extends BaseAgent {
   async run(payload = {}) {
     const query = normalizeQuery(payload);
@@ -266,35 +294,53 @@ class DealFinderAgent extends BaseAgent {
           continue;
         }
 
-        const user = JSON.stringify(
-          {
-            query,
-            sourceUrl: url,
-            candidates,
-          },
-          null,
-          2
-        );
+        let deals = [];
 
-        const raw = await this.withRetry(
-          () =>
-            complete({
-              system: SYSTEM,
-              user,
-              temperature: 0.15,
-              cacheTtlMs: 300_000,
-            }),
-          { label: 'gemini.dealDetect' }
-        );
-
-        let parsed;
         try {
-          parsed = JSON.parse(raw);
-        } catch {
-          parsed = { deals: [] };
+          const user = JSON.stringify(
+            {
+              query,
+              sourceUrl: url,
+              candidates,
+            },
+            null,
+            2
+          );
+
+          const raw = await this.withRetry(
+            () =>
+              complete({
+                system: SYSTEM,
+                user,
+                temperature: 0.15,
+                cacheTtlMs: 300_000,
+              }),
+            { label: 'gemini.dealDetect' }
+          );
+
+          let parsed;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            parsed = { deals: [] };
+          }
+
+          deals = normalizeDeals(url, parsed.deals);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+
+          if (isQuotaOrTemporaryModelError(message)) {
+            await this.log('warn', 'Deal scan LLM fallback used', {
+              url,
+              query,
+              message,
+            });
+            deals = fallbackDealsFromCandidates(url, candidates);
+          } else {
+            throw err;
+          }
         }
 
-        const deals = normalizeDeals(url, parsed.deals);
         allDeals.push(...deals);
 
         findings.push({
